@@ -3,116 +3,82 @@ name: Checkmarx One Scan
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  checkmarx:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Cx SCA Resolver
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p sca-resolver
-
-          curl \
-            --fail \
-            --location \
-            --retry 3 \
-            --output sca-resolver/ScaResolver-musl64.tar.gz \
-            https://sca-downloads.s3.amazonaws.com/cli/latest/ScaResolver-musl64.tar.gz
-
-          tar \
-            -xzf sca-resolver/ScaResolver-musl64.tar.gz \
-            -C sca-resolver
-
-          chmod +x sca-resolver/ScaResolver
-
-          echo "Conteúdo do diretório:"
-          ls -la sca-resolver
-
-          test -x sca-resolver/ScaResolver
-          test -f sca-resolver/Configuration.yml
-
-      - name: Checkmarx One Scan
+      - name: Checkmarx One CLI Action
         id: checkmarx
         continue-on-error: true
         uses: checkmarx/ast-github-action@2.3.39
         with:
           project_name: ${{ github.repository }}
-
           cx_tenant: ${{ secrets.CX_TENANT_NAME }}
           base_uri: ${{ secrets.CX_BASE_URI }}
           cx_client_id: ${{ secrets.CX_CLIENT_ID }}
           cx_client_secret: ${{ secrets.CX_CLIENT_SECRET }}
+          branch: ${{ github.ref }}
 
-          github_token: ${{ github.token }}
-          branch: ${{ github.ref_name }}
-
+          # Aguarda o término do scan por até 120 minutos.
+          # Não utilizar --async.
           scan_params: >-
             --scan-timeout 120
-            --scan-types sast,sca,iac-security,scs
-            --sca-resolver /github/workspace/sca-resolver/ScaResolver
-            --scs-engines scorecard
-            --scs-repo-url "${{ github.server_url }}/${{ github.repository }}"
-            --scs-repo-token "${{ github.token }}"
 
-      - name: Exibir resultado do Checkmarx
+      - name: Resultado do Checkmarx Security Gate
         if: always()
         shell: bash
         env:
-          CHECKMARX_OUTCOME: ${{ steps.checkmarx.outcome }}
-          CHECKMARX_SCAN_ID: ${{ steps.checkmarx.outputs.cxScanID }}
-          CHECKMARX_OUTPUT: ${{ steps.checkmarx.outputs.cxcli }}
+          CX_OUTCOME: ${{ steps.checkmarx.outcome }}
+          CX_SCAN_ID: ${{ steps.checkmarx.outputs.cxScanID }}
+          CX_OUTPUT: ${{ steps.checkmarx.outputs.cxcli }}
         run: |
           set -uo pipefail
 
           echo "======================================================"
           echo " Checkmarx One Security Gate"
           echo "======================================================"
-          echo "Scan ID: ${CHECKMARX_SCAN_ID:-não disponível}"
-          echo "Resultado: ${CHECKMARX_OUTCOME}"
+          echo "Scan ID: ${CX_SCAN_ID:-não disponível}"
+          echo "Resultado da execução: ${CX_OUTCOME}"
           echo
 
-          echo "::group::Saída completa do Checkmarx CLI"
+          echo "::group::Saída retornada pelo Checkmarx CLI"
 
-          if [[ -n "${CHECKMARX_OUTPUT:-}" ]]; then
-            printf '%s\n' "${CHECKMARX_OUTPUT}" |
-              sed 's/\\n/\n/g'
+          if [[ -n "${CX_OUTPUT:-}" ]]; then
+            # A action remove as quebras de linha do output.
+            # Esta substituição tenta restaurar quebras escapadas.
+            printf '%s\n' "${CX_OUTPUT}" | sed 's/\\n/\n/g'
           else
-            echo "Nenhuma saída adicional foi retornada pela action."
+            echo "Nenhuma saída adicional foi retornada."
           fi
 
           echo "::endgroup::"
 
           echo
-          echo "Informações relacionadas ao Security Gate:"
+          echo "Informações relacionadas a policies:"
 
-          GATE_DETAILS="$(
-            printf '%s\n' "${CHECKMARX_OUTPUT:-}" |
+          POLICY_OUTPUT="$(
+            printf '%s\n' "${CX_OUTPUT:-}" |
               sed 's/\\n/\n/g' |
-              grep -iE \
-                'policy|policies|violation|violated|break build|threshold|security gate' ||
-              true
+              grep -ioE \
+                '.{0,150}(policy|policies|violation|violated|break build|security gate).{0,400}' \
+                || true
           )"
 
-          if [[ -n "${GATE_DETAILS}" ]]; then
-            printf '%s\n' "${GATE_DETAILS}"
+          if [[ -n "${POLICY_OUTPUT}" ]]; then
+            printf '%s\n' "${POLICY_OUTPUT}"
           else
-            echo "Nenhuma descrição de policy foi identificada na saída."
-          fi
-
-          if [[ "${CHECKMARX_OUTCOME}" != "success" ]]; then
-            echo
-            echo "::error title=Checkmarx Security Gate reprovado::O scan falhou ou uma policy configurada para Break Build foi violada."
-            exit 1
+            echo "Nenhuma informação adicional de policy foi encontrada no output."
           fi
 
           echo
-          echo "::notice title=Checkmarx Security Gate aprovado::O scan foi concluído sem bloquear o build."
+
+          if [[ "${CX_OUTCOME}" != "success" ]]; then
+            echo "::error title=Checkmarx Security Gate reprovado::O scan falhou ou uma policy configurada com Break Build foi violada."
+            exit 1
+          fi
+
+          echo "::notice title=Checkmarx Security Gate aprovado::O scan foi concluído sem violação bloqueante."
